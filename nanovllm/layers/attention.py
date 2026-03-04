@@ -3,7 +3,13 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+# Try to use Triton implementation for Intel GPU, fallback to flash_attn
+try:
+    from .attention_triton import flash_attn_varlen_func, flash_attn_with_kvcache
+    print("Using Triton-based Flash Attention (Intel GPU support)")
+except ImportError:
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    print("Using original flash_attn")
 from nanovllm.utils.context import get_context
 
 
