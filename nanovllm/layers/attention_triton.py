@@ -34,22 +34,43 @@ def flash_attn_varlen_func(
         k = k.repeat_interleave(rep, dim=1)
         v = v.repeat_interleave(rep, dim=1)
     
-    # Reshape for SDPA: [total_q, num_heads, head_dim] -> [batch=1, num_heads, total_q, head_dim]
-    q = q.transpose(0, 1).unsqueeze(0)  # [1, num_heads, total_q, head_dim]
-    k = k.transpose(0, 1).unsqueeze(0)  # [1, num_heads, total_k, head_dim]
-    v = v.transpose(0, 1).unsqueeze(0)  # [1, num_heads, total_k, head_dim]
+    # Handle variable length sequences using cu_seqlens
+    outputs = []
     
-    # Apply attention using PyTorch SDPA
-    out = F.scaled_dot_product_attention(
-        q, k, v,
-        scale=softmax_scale,
-        attn_mask=None,
-        dropout_p=0.0,
-        is_causal=causal,
-    )
+    # Convert to list if tensor
+    if isinstance(cu_seqlens_q, torch.Tensor):
+        cu_seqlens_q = cu_seqlens_q.tolist()
+    if isinstance(cu_seqlens_k, torch.Tensor):
+        cu_seqlens_k = cu_seqlens_k.tolist()
     
-    # Reshape back: [batch, num_heads, total_q, head_dim] -> [total_q, num_heads, head_dim]
-    out = out.squeeze(0).transpose(0, 1).contiguous()
+    for i in range(len(cu_seqlens_q) - 1):
+        start_q = cu_seqlens_q[i]
+        end_q = cu_seqlens_q[i + 1]
+        start_k = cu_seqlens_k[i]
+        end_k = cu_seqlens_k[i + 1]
+        
+        q_i = q[start_q:end_q]
+        k_i = k[start_k:end_k]
+        v_i = v[start_k:end_k]
+        
+        # Reshape to SDPA format
+        q_i = q_i.transpose(0, 1).unsqueeze(0)
+        k_i = k_i.transpose(0, 1).unsqueeze(0)
+        v_i = v_i.transpose(0, 1).unsqueeze(0)
+        
+        # Apply attention
+        out_i = F.scaled_dot_product_attention(
+            q_i, k_i, v_i,
+            scale=softmax_scale,
+            is_causal=causal,
+        )
+        
+        # Reshape back
+        out_i = out_i.squeeze(0).transpose(0, 1)
+        outputs.append(out_i)
+    
+    # Concatenate outputs
+    out = torch.cat(outputs, dim=0)
     
     return out
 
@@ -58,81 +79,94 @@ def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    cache_seqlens: torch.Tensor = None,
-    block_table: torch.Tensor = None,
+    cache_seqlens: torch.Tensor,
+    block_table: torch.Tensor,
     softmax_scale: float = None,
-    causal: bool = True,
 ) -> torch.Tensor:
     """
-    PyTorch SDPA-based implementation of flash_attn_with_kvcache.
-    
-    k_cache shape: [num_blocks, block_size, num_kv_heads, head_dim]
+    Correct SDPA-based implementation of flash_attn_with_kvcache (decode stage).
+
+    Args:
+        q:              [batch, 1, num_heads, head_dim]
+        k_cache:        [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache:        [num_blocks, block_size, num_kv_heads, head_dim]
+        cache_seqlens:  [batch]  (context length per sample)
+        block_table:    [batch, max_num_blocks_per_seq] (logical → physical block mapping)
+
+    Returns:
+        out: [batch, num_heads, head_dim]
     """
+
+    device = q.device
+    dtype = q.dtype
+
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
-    
-    # q is [batch, 1, num_heads, head_dim]
-    batch_size = q.shape[0]
-    num_heads = q.shape[2]
-    head_dim = q.shape[3]
-    
-    # k_cache shape: [num_blocks, block_size, num_kv_heads, head_dim]
-    num_blocks = k_cache.shape[0]
+
+    batch_size, _, num_heads, head_dim = q.shape
     block_size = k_cache.shape[1]
     num_kv_heads = k_cache.shape[2]
-    
-    # Get context lengths
-    if cache_seqlens is None:
-        context_lens = [0] * batch_size
-    else:
-        context_lens = cache_seqlens.tolist() if isinstance(cache_seqlens, torch.Tensor) else cache_seqlens
-    
+
     outputs = []
+
     for b in range(batch_size):
-        q_b = q[b]  # [1, num_heads, head_dim]
-        context_len = context_lens[b] if isinstance(context_lens, list) else int(context_lens)
-        
-        if context_len > 0:
-            # Calculate how many blocks are filled
-            num_filled_blocks = (context_len + block_size - 1) // block_size
-            filled_len = context_len
-            
-            # Flatten the filled blocks: [num_filled_blocks, block_size, num_kv_heads, head_dim]
-            k_b = k_cache[:num_filled_blocks, :filled_len, :, :].reshape(-1, num_kv_heads, head_dim)
-            v_b = v_cache[:num_filled_blocks, :filled_len, :, :].reshape(-1, num_kv_heads, head_dim)
-            
-            # Handle GQA: repeat k/v to match num_heads
-            if num_heads != num_kv_heads:
-                rep = num_heads // num_kv_heads
-                k_b = k_b.repeat(1, rep, 1)  # [seq_len, num_heads, head_dim]
-                v_b = v_b.repeat(1, rep, 1)
-            
-            # Reshape for SDPA
-            seq_len = k_b.shape[0]
-            k_b = k_b.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seq_len, head_dim]
-            v_b = v_b.transpose(0, 1).unsqueeze(0)
-            q_b_for_sdpa = q_b.unsqueeze(2)  # [1, num_heads, 1, head_dim]
-            
-            # Apply attention
-            out_b = F.scaled_dot_product_attention(
-                q_b_for_sdpa, k_b, v_b,
-                scale=softmax_scale,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=causal,
+        context_len = int(cache_seqlens[b])
+
+        if context_len == 0:
+            outputs.append(
+                torch.zeros(num_heads, head_dim, device=device, dtype=dtype)
             )
-            
-            # Reshape back: [1, num_heads, 1, head_dim] -> [num_heads, head_dim]
-            out_b = out_b.squeeze(0).transpose(0, 1).squeeze(1)
-        else:
-            out_b = torch.zeros(num_heads, head_dim, dtype=torch.float32)
-        
-        outputs.append(out_b)
-    
-    # Stack: [batch, num_heads, head_dim]
-    result = torch.stack(outputs, dim=0)
-    
-    # Add seq_len=1 dimension: [batch, 1, num_heads, head_dim]
-    result = result.unsqueeze(1)
-    
+            continue
+
+        # 1. Determine how many blocks are needed
+        num_blocks_needed = (context_len + block_size - 1) // block_size
+
+        # 2. Gather physical blocks via block_table
+        physical_block_ids = block_table[b, :num_blocks_needed]
+
+        k_blocks = k_cache[physical_block_ids]  # [num_blocks, block_size, kv_heads, dim]
+        v_blocks = v_cache[physical_block_ids]
+
+        # 3. Flatten blocks
+        k_flat = k_blocks.reshape(-1, num_kv_heads, head_dim)
+        v_flat = v_blocks.reshape(-1, num_kv_heads, head_dim)
+
+        # 4. Truncate to true context length
+        k_flat = k_flat[:context_len]
+        v_flat = v_flat[:context_len]
+
+        # 5. Handle GQA (expand kv heads if needed)
+        if num_heads != num_kv_heads:
+            rep = num_heads // num_kv_heads
+            k_flat = k_flat.repeat_interleave(rep, dim=1)
+            v_flat = v_flat.repeat_interleave(rep, dim=1)
+
+        # 6. Convert to SDPA layout
+        # q: [1, num_heads, 1, head_dim]
+        q_b = q[b].permute(1, 0, 2).unsqueeze(0)
+
+        # k/v: [1, num_heads, context_len, head_dim]
+        k_b = k_flat.permute(1, 0, 2).unsqueeze(0)
+        v_b = v_flat.permute(1, 0, 2).unsqueeze(0)
+
+        # 7. Decode attention
+        # IMPORTANT: is_causal=False
+        out = F.scaled_dot_product_attention(
+            q_b,
+            k_b,
+            v_b,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=softmax_scale,
+        )
+
+        # [1, num_heads, 1, dim] → [num_heads, dim]
+        out = out.squeeze(0).squeeze(1)
+
+        outputs.append(out)
+
+    # 8. Stack results
+    result = torch.stack(outputs, dim=0)  # [batch, num_heads, head_dim]
+
     return result
