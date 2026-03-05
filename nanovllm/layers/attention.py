@@ -10,11 +10,15 @@ import triton.language as tl
 #     from .attention_triton import flash_attn_varlen_func, flash_attn_with_kvcache
 #     print("Using Triton-based Flash Attention (Intel GPU support)")
 try:
-    from .attention_sdpa import flash_attn_varlen_func, flash_attn_with_kvcache
-    print("Using sdpa-based Flash Attention (Intel GPU support)")
+    from .attention_triton_v2 import flash_attn_varlen_func, flash_attn_with_kvcache
+    print("Using Triton v2-based Flash Attention (Intel GPU support)")
 except ImportError:
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-    print("Using original flash_attn")
+    try:
+        from .attention_sdpa import flash_attn_varlen_func, flash_attn_with_kvcache
+        print("Using sdpa-based Flash Attention (Intel GPU support)")
+    except ImportError:
+        from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+        print("Using original flash_attn")
 from nanovllm.utils.context import get_context
 
 

@@ -6,7 +6,7 @@ import numpy as np
 
 @triton.jit
 def attn_kernel_register_fused_heads_bf16(
-    Q_ptr, K_ptr, V_ptr, O_ptr, q_pos_ptr,
+    Q_ptr, K_ptr, V_ptr, O_ptr,
     batch_size, num_heads, num_kv_heads, qlen, kvlen, head_dim,
     q_stride_batch, q_stride_head, q_stride_seq, q_stride_dim,
     k_stride_batch, k_stride_head, k_stride_seq, k_stride_dim,
@@ -46,12 +46,12 @@ def attn_kernel_register_fused_heads_bf16(
             m_i = tl.full((BLOCK_M,), value=float('-inf'), dtype=tl.bfloat16)
             l_i = tl.zeros((BLOCK_M,), dtype=tl.bfloat16)
             
-            q_pos = tl.load(q_pos_ptr + offs_m, mask=qlen_mask)
-            max_valid_kv = tl.max(q_pos) + 1
+            # 简化的 causal mask: 直接使用 kvlen
+            max_valid_kv = kvlen
             
             for start_n in tl.range(0, max_valid_kv, BLOCK_N):
                 offs_n = start_n + tl.arange(0, BLOCK_N)
-                kvlen_mask = offs_n < max_valid_kv
+                kvlen_mask = offs_n < kvlen
                 
                 kv_head_id = head_id // n_rep
                 
@@ -69,7 +69,8 @@ def attn_kernel_register_fused_heads_bf16(
                 
                 scores = tl.dot(q, tl.trans(k))
                 
-                causal_mask = offs_n[None, :] > q_pos[:, None]
+                # Causal mask: K 位置 >= Q 位置时置为 -inf
+                causal_mask = (start_m + offs_n)[None, :] >= (start_m + offs_m)[:, None]
                 scores = tl.where(causal_mask, float('-inf'), scores)
                 
                 m_ij = tl.max(scores, axis=1)
@@ -96,7 +97,7 @@ def attn_kernel_register_fused_heads_bf16(
 
 @triton.jit
 def attn_kernel_register_fused_heads_bf16_tensor_descriptor(
-    Q_ptr, K_ptr, V_ptr, O_ptr, q_pos_ptr,
+    Q_ptr, K_ptr, V_ptr, O_ptr,
     batch_size, num_heads, num_kv_heads, qlen, kvlen, head_dim,
     q_stride_batch, q_stride_head, q_stride_seq, q_stride_dim,
     k_stride_batch, k_stride_head, k_stride_seq, k_stride_dim,
@@ -146,8 +147,8 @@ def attn_kernel_register_fused_heads_bf16_tensor_descriptor(
             m_i = tl.full((BLOCK_M,), value=float('-inf'), dtype=tl.bfloat16)
             l_i = tl.zeros((BLOCK_M,), dtype=tl.bfloat16)
             
-            q_pos = tl.load(q_pos_ptr + offs_m, mask=qlen_mask)
-            max_valid_kv = tl.max(q_pos) + 1
+            # 简化的 causal mask: 直接使用 kvlen
+            max_valid_kv = kvlen
             
             kv_head_id = head_id // n_rep
             
@@ -192,7 +193,8 @@ def attn_kernel_register_fused_heads_bf16_tensor_descriptor(
                 ).to(tl.bfloat16)
                 
                 scores = tl.dot(q, tl.trans(k))                
-                causal_mask = offs_n[None, :] > q_pos[:, None]
+                # Causal mask: K 位置 >= Q 位置时置为 -inf
+                causal_mask = (start_m + offs_n)[None, :] >= (start_m + offs_m)[:, None]
                 scores = tl.where(causal_mask, float('-inf'), scores)
                 
                 m_ij = tl.max(scores, axis=1)
@@ -222,7 +224,6 @@ def query_sparse_attn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_position: torch.LongTensor,
     heads_per_group: int = 1,
 ) -> torch.Tensor:
     batch, num_attention_heads, qlen, head_dim = q.shape
@@ -250,7 +251,6 @@ def query_sparse_attn(
     
     kernel_func[grid](
         q, k, v, output,
-        q_position,
         batch, num_attention_heads, num_key_value_heads, qlen, kvlen, head_dim,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -281,8 +281,7 @@ def warmup_kernels_device(device: str):
     q = torch.randn(1, 4, 1, 128, device=device, dtype=torch.bfloat16)
     k = torch.randn(1, 1, 1, 128, device=device, dtype=torch.bfloat16)
     v = torch.randn(1, 1, 1, 128, device=device, dtype=torch.bfloat16)
-    q_pos = torch.zeros(1, device=device, dtype=torch.long)
-    _ = query_sparse_attn(q, k, v, q_pos)
+    _ = query_sparse_attn(q, k, v)
 
     if device == "cuda":
         torch.cuda.synchronize()
