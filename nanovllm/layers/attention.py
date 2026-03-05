@@ -6,9 +6,12 @@ import triton.language as tl
 # from nanovllm.nano_flash_attention.nano_flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 
 # Try to use Triton implementation for Intel GPU, fallback to flash_attn
+# try:
+#     from .attention_triton import flash_attn_varlen_func, flash_attn_with_kvcache
+#     print("Using Triton-based Flash Attention (Intel GPU support)")
 try:
-    from .attention_triton import flash_attn_varlen_func, flash_attn_with_kvcache
-    print("Using Triton-based Flash Attention (Intel GPU support)")
+    from .attention_sdpa import flash_attn_varlen_func, flash_attn_with_kvcache
+    print("Using sdpa-based Flash Attention (Intel GPU support)")
 except ImportError:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
     print("Using original flash_attn")

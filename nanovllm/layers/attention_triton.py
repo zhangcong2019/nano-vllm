@@ -1,10 +1,107 @@
 """
-PyTorch SDPA-based Flash Attention implementation for Intel GPUs.
+Triton-based Flash Attention implementation for Intel GPUs.
 This replaces the flash_attn package for Intel GPU compatibility.
 """
 
 import torch
-import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _attn_fwd_inner(
+    acc, l_i, m_i, q, K_block_ptr, K_block_slice, head_dim, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    """Inner attention loop."""
+    # load k - shape: [BLOCK_N, head_dim]
+    k = tl.load(K_block_ptr)
+    # compute qk - shape: [BLOCK_M, BLOCK_N]
+    qk = tl.dot(q, k.T)
+    
+    # apply causal mask
+    if BLOCK_N < BLOCK_M:
+        qk = tl.where(qk < 0, qk, float("-inf"))
+    
+    # softmax
+    m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+    qk = qk - m_ij[:, None]
+    p = tl.exp(qk)
+    l_ij = tl.sum(p, axis=1)
+    
+    # scale and accumulate
+    m_i = m_ij
+    p = p * (1.0 / tl.exp(m_i - m_ij[:, None]))
+    l_i = l_i * tl.exp(m_i - m_ij[:, None]) + l_ij
+    
+    # update accumulator
+    # p: [BLOCK_M, BLOCK_N], v: [BLOCK_N, head_dim] -> [BLOCK_M, head_dim]
+    v = tl.load(K_block_ptr + BLOCK_N * head_dim)
+    acc += tl.dot(p, v)
+    
+    return acc, l_i, m_i
+
+
+@triton.jit
+def _attn_fwd_kernel(
+    Q, K, V, Out,
+    Lse,  # logsumexp for backward
+    stride_qb, stride_qh, stride_qm, stride_qk,
+    stride_kb, stride_kh, stride_kn, stride_kk,
+    stride_vb, stride_vh, stride_vn, stride_vk,
+    stride_ob, stride_oh, stride_om, stride_ok,
+    B: tl.constexpr, H: tl.constexpr, M: tl.constexpr, N: tl.constexpr,
+    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """Forward attention kernel."""
+    # batch and head index
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    
+    # block row index (over sequence dimension M)
+    row_idx = tl.program_id(2)
+    row_offset = row_idx * BLOCK_M
+    
+    # pointers
+    Q += batch_idx * stride_qb + head_idx * stride_qh + row_offset * stride_qm
+    K += batch_idx * stride_kb + head_idx * stride_kh
+    V += batch_idx * stride_vb + head_idx * stride_vh
+    Out += batch_idx * stride_ob + head_idx * stride_oh + row_offset * stride_om
+    Lse += batch_idx * H * M + head_idx * M + row_offset
+    
+    # initialize accumulator
+    acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+    
+    # load q - shape: [BLOCK_M, HEAD_DIM]
+    q_ptrs = Q + tl.arange(0, BLOCK_M)[:, None] * stride_qm + tl.arange(0, HEAD_DIM)[None, :] * stride_qk
+    q_mask = (row_offset + tl.arange(0, BLOCK_M)) < M
+    q = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+    
+    # loop over k/v blocks
+    num_blocks = tl.cdiv(N, BLOCK_N)
+    for block_idx in range(num_blocks):
+        K_block_ptr = K + block_idx * BLOCK_N * stride_kn
+        V_block_ptr = V + block_idx * BLOCK_N * stride_vn
+        acc, l_i, m_i = _attn_fwd_inner(
+            acc, l_i, m_i, q, K_block_ptr, BLOCK_N, HEAD_DIM, BLOCK_M, BLOCK_N
+        )
+    
+    # softmax scale
+    softmax_scale = 1.0  # TODO: make this configurable
+    acc = acc * softmax_scale
+    
+    # normalize
+    l_i = l_i + 1e-8  # numerical stability
+    acc = acc / l_i[:, None]
+    
+    # store output
+    out_ptrs = Out + tl.arange(0, BLOCK_M)[:, None] * stride_om + tl.arange(0, HEAD_DIM)[None, :] * stride_ok
+    tl.store(out_ptrs, acc, mask=q_mask[:, None])
+    
+    # store logsumexp for backward
+    m_i = m_i + tl.log(l_i)
+    tl.store(Lse + tl.arange(0, BLOCK_M), m_i, mask=q_mask)
 
 
 def flash_attn_varlen_func(
@@ -20,153 +117,173 @@ def flash_attn_varlen_func(
     block_table: torch.Tensor = None,
 ) -> torch.Tensor:
     """
-    PyTorch SDPA-based implementation of flash_attn_varlen_func.
+    Triton implementation of flash_attn_varlen_func for Intel GPUs.
+    
+    Args:
+        q: [total_q, num_heads, head_dim] - query tensor
+        k: [total_k, num_kv_heads, head_dim] - key tensor
+        v: [total_k, num_kv_heads, head_dim] - value tensor
+        max_seqlen_q: maximum sequence length for queries
+        cu_seqlens_q: cumulative sequence lengths for queries
+        max_seqlen_k: maximum sequence length for keys
+        cu_seqlens_k: cumulative sequence lengths for keys
+        softmax_scale: scaling factor (default: 1/sqrt(head_dim))
+        causal: whether to apply causal masking
+        block_table: prefix cache block table (not fully supported yet)
+    
+    Returns:
+        out: [total_q, num_heads, head_dim] - attention output
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
     
+    # Get dimensions
     total_q, num_heads, head_dim = q.shape
-    num_kv_heads = k.shape[1]
+    total_k = k.shape[0]
     
-    # Handle GQA - repeat k/v if needed to match num_heads
-    if num_heads != num_kv_heads:
-        rep = num_heads // num_kv_heads
-        k = k.repeat_interleave(rep, dim=1)
-        v = v.repeat_interleave(rep, dim=1)
+    # For simplicity, handle single sequence case
+    # Variable length support would require splitting by cu_seqlens
+    B, H, M, N = 1, num_heads, total_q, total_k
+    HEAD_DIM = head_dim
     
-    # Handle variable length sequences using cu_seqlens
-    outputs = []
+    # Allocate output
+    out = torch.empty_like(q)
+    lse = torch.empty((total_q, num_heads), dtype=torch.float32, device=q.device)
     
-    # Convert to list if tensor
-    if isinstance(cu_seqlens_q, torch.Tensor):
-        cu_seqlens_q = cu_seqlens_q.tolist()
-    if isinstance(cu_seqlens_k, torch.Tensor):
-        cu_seqlens_k = cu_seqlens_k.tolist()
+    # Triton config
+    BLOCK_M = 64
+    BLOCK_N = 64
     
-    for i in range(len(cu_seqlens_q) - 1):
-        start_q = cu_seqlens_q[i]
-        end_q = cu_seqlens_q[i + 1]
-        start_k = cu_seqlens_k[i]
-        end_k = cu_seqlens_k[i + 1]
-        
-        q_i = q[start_q:end_q]
-        k_i = k[start_k:end_k]
-        v_i = v[start_k:end_k]
-        
-        # Reshape to SDPA format
-        q_i = q_i.transpose(0, 1).unsqueeze(0)
-        k_i = k_i.transpose(0, 1).unsqueeze(0)
-        v_i = v_i.transpose(0, 1).unsqueeze(0)
-        
-        # Apply attention
-        out_i = F.scaled_dot_product_attention(
-            q_i, k_i, v_i,
-            scale=softmax_scale,
-            is_causal=causal,
-        )
-        
-        # Reshape back
-        out_i = out_i.squeeze(0).transpose(0, 1)
-        outputs.append(out_i)
+    grid = (B, H, triton.cdiv(M, BLOCK_M))
     
-    # Concatenate outputs
-    out = torch.cat(outputs, dim=0)
+    _attn_fwd_kernel[grid](
+        q, k, v, out, lse,
+        q.stride(0), q.stride(1), q.stride(0), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(0), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(0), v.stride(2),
+        out.stride(0), out.stride(1), out.stride(0), out.stride(2),
+        B, H, M, N, HEAD_DIM, BLOCK_M, BLOCK_N,
+    )
     
     return out
+
+
+@triton.jit
+def _attn_kvcache_kernel(
+    Q, K_cache, V_cache, Out,
+    cache_seqlens, block_table,
+    stride_qb, stride_qh, stride_qm, stride_qk,
+    stride_kb, stride_kh, stride_kn, stride_kk,
+    stride_vb, stride_vh, stride_vn, stride_vk,
+    stride_ob, stride_oh, stride_om, stride_ok,
+    B: tl.constexpr, H: tl.constexpr, M: tl.constexpr, N: tl.constexpr,
+    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """Forward attention kernel with KV cache."""
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    row_idx = tl.program_id(2)
+    row_offset = row_idx * BLOCK_M
+    
+    # pointers
+    Q += batch_idx * stride_qb + head_idx * stride_qh + row_offset * stride_qm
+    Out += batch_idx * stride_ob + head_idx * stride_oh + row_offset * stride_om
+    
+    # get context length for this query
+    context_len = tl.load(cache_seqlens + batch_idx * M + row_offset)
+    
+    # initialize accumulator
+    acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+    
+    # load q
+    q_ptrs = Q + tl.arange(0, BLOCK_M)[:, None] * stride_qm + tl.arange(0, HEAD_DIM)[None, :] * stride_qk
+    q_mask = row_offset + tl.arange(0, BLOCK_M) < M
+    q = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+    
+    # loop over available KV cache blocks
+    num_blocks = tl.cdiv(context_len, BLOCK_N)
+    for block_idx in range(num_blocks):
+        K_block_ptr = K_cache + batch_idx * stride_kb + head_idx * stride_kh + block_idx * BLOCK_N * stride_kn
+        V_block_ptr = V_cache + batch_idx * stride_vb + head_idx * stride_vh + block_idx * BLOCK_N * stride_vn
+        acc, l_i, m_i = _attn_fwd_inner(
+            acc, l_i, m_i, q, K_block_ptr, BLOCK_N, HEAD_DIM, BLOCK_M, BLOCK_N
+        )
+    
+    # apply causal mask if needed
+    if context_len < N:
+        pass  # causal is handled in inner loop
+    
+    # softmax scale
+    softmax_scale = 1.0
+    acc = acc * softmax_scale
+    
+    # normalize
+    l_i = l_i + 1e-8
+    acc = acc / l_i[:, None]
+    
+    # store output
+    out_ptrs = Out + tl.arange(0, BLOCK_M)[:, None] * stride_om + tl.arange(0, HEAD_DIM)[None, :] * stride_ok
+    tl.store(out_ptrs, acc, mask=q_mask[:, None])
 
 
 def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor = None,
+    block_table: torch.Tensor = None,
     softmax_scale: float = None,
+    causal: bool = True,
 ) -> torch.Tensor:
     """
-    Correct SDPA-based implementation of flash_attn_with_kvcache (decode stage).
-
+    Triton implementation of flash_attn_with_kvcache for Intel GPUs.
+    
     Args:
-        q:              [batch, 1, num_heads, head_dim]
-        k_cache:        [num_blocks, block_size, num_kv_heads, head_dim]
-        v_cache:        [num_blocks, block_size, num_kv_heads, head_dim]
-        cache_seqlens:  [batch]  (context length per sample)
-        block_table:    [batch, max_num_blocks_per_seq] (logical → physical block mapping)
-
+        q: [batch_size, num_heads, head_dim] - query tensor (decode step)
+        k_cache: [batch_size, num_kv_heads, cache_max_len, head_dim] - cached keys
+        v_cache: [batch_size, num_kv_heads, cache_max_len, head_dim] - cached values
+        cache_seqlens: context lengths for each query
+        block_table: block table for paging (not fully supported)
+        softmax_scale: scaling factor
+        causal: whether to apply causal masking
+    
     Returns:
-        out: [batch, num_heads, head_dim]
+        out: [batch_size, num_heads, head_dim] - attention output
     """
-
-    device = q.device
-    dtype = q.dtype
-
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
-
-    batch_size, _, num_heads, head_dim = q.shape
-    block_size = k_cache.shape[1]
-    num_kv_heads = k_cache.shape[2]
-
-    outputs = []
-
-    for b in range(batch_size):
-        context_len = int(cache_seqlens[b])
-
-        if context_len == 0:
-            outputs.append(
-                torch.zeros(num_heads, head_dim, device=device, dtype=dtype)
-            )
-            continue
-
-        # 1. Determine how many blocks are needed
-        num_blocks_needed = (context_len + block_size - 1) // block_size
-
-        # 2. Gather physical blocks via block_table
-        physical_block_ids = block_table[b, :num_blocks_needed]
-
-        k_blocks = k_cache[physical_block_ids]  # [num_blocks, block_size, kv_heads, dim]
-        v_blocks = v_cache[physical_block_ids]
-
-        # 3. Flatten blocks
-        k_flat = k_blocks.reshape(-1, num_kv_heads, head_dim)
-        v_flat = v_blocks.reshape(-1, num_kv_heads, head_dim)
-
-        # 4. Truncate to true context length
-        k_flat = k_flat[:context_len]
-        v_flat = v_flat[:context_len]
-
-        # 5. Handle GQA (expand kv heads if needed)
-        if num_heads != num_kv_heads:
-            rep = num_heads // num_kv_heads
-            k_flat = k_flat.repeat_interleave(rep, dim=1)
-            v_flat = v_flat.repeat_interleave(rep, dim=1)
-
-        # 6. Convert to SDPA layout
-        # q: [1, num_heads, 1, head_dim]
-        q_b = q[b].permute(1, 0, 2).unsqueeze(0)
-
-        # k/v: [1, num_heads, context_len, head_dim]
-        k_b = k_flat.permute(1, 0, 2).unsqueeze(0)
-        v_b = v_flat.permute(1, 0, 2).unsqueeze(0)
-
-        # 7. Decode attention
-        # IMPORTANT: is_causal=False
-        out = F.scaled_dot_product_attention(
-            q_b,
-            k_b,
-            v_b,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=softmax_scale,
-        )
-
-        # [1, num_heads, 1, dim] → [num_heads, dim]
-        out = out.squeeze(0).squeeze(1)
-
-        outputs.append(out)
-
-    # 8. Stack results
-    result = torch.stack(outputs, dim=0)  # [batch, num_heads, head_dim]
-
-    return result
+    
+    # Get dimensions - q is [batch, num_heads, 1, head_dim] or [batch, num_heads, head_dim]
+    if q.dim() == 4:
+        q = q.squeeze(2)  # [batch, num_heads, head_dim]
+    
+    batch_size, num_heads, head_dim = q.shape
+    cache_max_len = k_cache.shape[2]
+    
+    # Allocate output
+    out = torch.empty_like(q)
+    
+    # Triton config
+    BLOCK_M = 64
+    BLOCK_N = 64
+    
+    # For decode, M=1 typically
+    M = q.shape[1]  # num_heads actually for this case
+    N = cache_max_len
+    H = 1  # treat as single "head" in grid since we iterate over actual heads
+    B = batch_size
+    
+    grid = (B, 1, 1)  # Simplified grid
+    
+    _attn_kvcache_kernel[grid](
+        q, k_cache, v_cache, out, cache_seqlens, block_table,
+        q.stride(0), q.stride(1), q.stride(1), q.stride(2),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+        out.stride(0), out.stride(1), out.stride(1), out.stride(2),
+        B, H, M, N, HEAD_DIM, BLOCK_M, BLOCK_N,
+    )
+    
+    return out
