@@ -194,7 +194,10 @@ def attn_kernel_register_fused_heads_bf16_tensor_descriptor(
                 
                 scores = tl.dot(q, tl.trans(k))                
                 # Causal mask: K 位置 >= Q 位置时置为 -inf
-                causal_mask = (start_m + offs_n)[None, :] >= (start_m + offs_m)[:, None]
+                q_pos = offs_m
+                k_pos = offs_n
+
+                causal_mask = k_pos[None, :] > q_pos[:, None]
                 scores = tl.where(causal_mask, float('-inf'), scores)
                 
                 m_ij = tl.max(scores, axis=1)
@@ -226,6 +229,10 @@ def query_sparse_attn(
     v: torch.Tensor,
     heads_per_group: int = 1,
 ) -> torch.Tensor:
+    """
+    batch, num_attention_heads, qlen, head_dim = q.shape
+    batch_k, num_key_value_heads, kvlen, _ = k.shape
+    """
     batch, num_attention_heads, qlen, head_dim = q.shape
     batch_k, num_key_value_heads, kvlen, _ = k.shape
     
@@ -262,7 +269,7 @@ def query_sparse_attn(
         num_stages=NUM_STAGES,
     )
     
-    output = output.transpose(1, 2).contiguous()
+    # output = output.transpose(1, 2).contiguous()
     return output
 
 _KERNEL_WARMED_UP = False

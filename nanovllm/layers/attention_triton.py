@@ -120,19 +120,21 @@ def flash_attn_varlen_func(
     Triton implementation of flash_attn_varlen_func for Intel GPUs.
     
     Args:
-        q: [total_q, num_heads, head_dim] - query tensor
-        k: [total_k, num_kv_heads, head_dim] - key tensor
-        v: [total_k, num_kv_heads, head_dim] - value tensor
-        max_seqlen_q: maximum sequence length for queries
-        cu_seqlens_q: cumulative sequence lengths for queries
-        max_seqlen_k: maximum sequence length for keys
-        cu_seqlens_k: cumulative sequence lengths for keys
+        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into kv.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
         softmax_scale: scaling factor (default: 1/sqrt(head_dim))
         causal: whether to apply causal masking
         block_table: prefix cache block table (not fully supported yet)
     
-    Returns:
-        out: [total_q, num_heads, head_dim] - attention output
+    Return:
+        out: (total, nheads, headdim).
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
@@ -241,16 +243,22 @@ def flash_attn_with_kvcache(
     Triton implementation of flash_attn_with_kvcache for Intel GPUs.
     
     Args:
-        q: [batch_size, num_heads, head_dim] - query tensor (decode step)
-        k_cache: [batch_size, num_kv_heads, cache_max_len, head_dim] - cached keys
-        v_cache: [batch_size, num_kv_heads, cache_max_len, head_dim] - cached values
+        q: (batch_size, seqlen, nheads, headdim)
+        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
+            or (num_blocks, page_block_size, nheads_k, headdim) if there's a block_table (i.e. paged KV cache)
+            page_block_size must be a multiple of 256.
+        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
+            or (num_blocks, page_block_size, nheads_k, headdim) if there's a block_table (i.e. paged KV cache)
+        k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
+            k with k_cache, starting at the indices specified by cache_seqlens.
+        v [optional]: (batch_size, seqlen_new, nheads_k, headdim). Similar to k.
         cache_seqlens: context lengths for each query
         block_table: block table for paging (not fully supported)
         softmax_scale: scaling factor
         causal: whether to apply causal masking
     
     Returns:
-        out: [batch_size, num_heads, head_dim] - attention output
+        out: (batch_size, seqlen, nheads, headdim).
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)

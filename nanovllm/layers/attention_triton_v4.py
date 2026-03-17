@@ -2,10 +2,13 @@
 PyTorch SDPA-based Flash Attention implementation for Intel GPUs.
 This replaces the flash_attn package for Intel GPU compatibility.
 """
-
 import torch
-import torch.nn.functional as F
+from nanovllm.nano_flash_attention.sparse_attn_triton import (
+    query_sparse_attn,
+    attn_kernel_register_fused_heads_bf16_tensor_descriptor,
+)
 
+import torch.nn.functional as F
 
 def flash_attn_varlen_func(
     q: torch.Tensor,
@@ -74,11 +77,18 @@ def flash_attn_varlen_func(
         v_i = v_i.transpose(0, 1).unsqueeze(0)
         
         # Apply attention
-        out_i = F.scaled_dot_product_attention(
-            q_i, k_i, v_i,
-            scale=softmax_scale,
-            is_causal=causal,
+
+        out_i = query_sparse_attn(
+            q_i, k_i, v_i, 2
         )
+        print(f"out_i shape sparse: {out_i.shape}")
+
+        # out_i = F.scaled_dot_product_attention(
+        #     q_i, k_i, v_i,
+        #     scale=softmax_scale,
+        #     is_causal=causal,
+        # )
+        # print(f"out_i shape: {out_i.shape}")
         
         # Reshape back
         out_i = out_i.squeeze(0).transpose(0, 1)
@@ -174,15 +184,25 @@ def flash_attn_with_kvcache(
 
         # 7. Decode attention
         # IMPORTANT: is_causal=False
-        out = F.scaled_dot_product_attention(
+
+        out = query_sparse_attn(
             q_b,
             k_b,
             v_b,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=softmax_scale,
+            2
         )
+        print(f"out shape sparse: {out.shape}")
+        
+        # out = F.scaled_dot_product_attention(
+        #     q_b,
+        #     k_b,
+        #     v_b,
+        #     attn_mask=None,
+        #     dropout_p=0.0,
+        #     is_causal=False,
+        #     scale=softmax_scale,
+        # )
+        # print(f"out shape: {out.shape}")
 
         # [1, num_heads, 1, dim] → [num_heads, dim]
         out = out.squeeze(0).squeeze(1)

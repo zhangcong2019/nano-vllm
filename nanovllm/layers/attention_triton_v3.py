@@ -16,57 +16,37 @@ def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
+    cu_seqlens_q: torch.Tensor,
     max_seqlen_k: int,
-    dropout_p: float = 0.0,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
-    softcap: float = 0.0,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    deterministic: bool = False,
-    return_attn_probs: bool = False,
-    block_table: Optional[torch.Tensor] = None,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float = None,
+    causal: bool = True,
+    block_table: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Flash attention for variable length sequences.
     
     Args:
-        q: (total_q, nheads, headdim) - Query tensor
-        k: (total_k, nheads_k, headdim) - Key tensor
-        v: (total_k, nheads_k, headdim) - Value tensor
-        cu_seqlens_q: (batch_size + 1,) - Cumulative sequence lengths for Q
-        cu_seqlens_k: (batch_size + 1,) - Cumulative sequence lengths for K/V
-        max_seqlen_q: Maximum sequence length for Q
-        max_seqlen_k: Maximum sequence length for K/V
-        dropout_p: Dropout probability (currently not supported)
-        softmax_scale: Softmax scaling factor
-        causal: Whether to apply causal masking
-        window_size: Sliding window size (left, right)
-        softcap: Softcap value (currently not supported)
-        alibi_slopes: ALiBi slopes (currently not supported)
-        deterministic: Whether to use deterministic mode
-        return_attn_probs: Whether to return attention probabilities
-        block_table: Paged KV cache block table (currently not supported)
+        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into kv.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
+        softmax_scale: scaling factor (default: 1/sqrt(head_dim))
+        causal: whether to apply causal masking
+        block_table: prefix cache block table (not fully supported yet)
     
-    Returns:
-        out: (total_q, nheads, headdim) - Attention output
+    Return:
+        out: (total, nheads, headdim).
     """
     # Check for unsupported features
-    if dropout_p != 0.0:
-        raise NotImplementedError("dropout is not supported in sparse attention v3")
-    if window_size != (-1, -1):
-        raise NotImplementedError("sliding window is not supported in sparse attention v3")
-    if softcap != 0.0:
-        raise NotImplementedError("softcap is not supported in sparse attention v3")
-    if alibi_slopes is not None:
-        raise NotImplementedError("alibi_slopes is not supported in sparse attention v3")
     if block_table is not None:
         raise NotImplementedError("paged attention is not supported in sparse attention v3")
-    if return_attn_probs:
-        raise NotImplementedError("return_attn_probs is not supported in sparse attention v3")
     
     # Input format: thd (total, heads, dim)
     total_q, nheads_q, head_dim = q.shape
@@ -113,7 +93,7 @@ def flash_attn_varlen_func(
         out_seq = query_sparse_attn(q_bshd, k_bshd, v_bshd, heads_per_group=heads_per_group)
         
         # Transpose back to thd layout: (seq_len_q, nheads_q, head_dim)
-        out[start_q:end_q] = out_seq.squeeze(0).transpose(0, 1)
+        out[:,start_q:end_q,:] = out_seq.squeeze(0).transpose(0, 1)
     
     return out
 
@@ -122,69 +102,35 @@ def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k: Optional[torch.Tensor] = None,
-    v: Optional[torch.Tensor] = None,
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
-    cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
-    cache_batch_idx: Optional[torch.Tensor] = None,
-    cache_leftpad: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
-    softcap: float = 0.0,
-    rotary_interleaved: bool = True,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    num_splits: int = 0,
-    return_softmax_lse: bool = False,
+    cache_seqlens: torch.Tensor = None,
+    block_table: torch.Tensor = None,
+    softmax_scale: float = None,
+    causal: bool = True,
 ) -> torch.Tensor:
     """
     Flash attention with KV cache support.
     
     Args:
-        q: (batch_size, seqlen_q, nheads, headdim) - Query tensor
-        k_cache: (batch_size, cache_seqlen, nheads_k, headdim) - Cached K tensor
-        v_cache: (batch_size, cache_seqlen, nheads_k, headdim) - Cached V tensor
-        k: Optional new K tokens to append to cache
-        v: Optional new V tokens to append to cache
-        rotary_cos: Rotary embedding cos
-        rotary_sin: Rotary embedding sin
-        cache_seqlens: Current sequence lengths in cache
-        cache_batch_idx: Batch indices for cache access
-        cache_leftpad: Left padding offsets
-        block_table: Paged KV cache block table
-        softmax_scale: Softmax scaling factor
-        causal: Whether to apply causal masking
-        window_size: Sliding window size (left, right)
-        softcap: Softcap value (currently not supported)
-        rotary_interleaved: Whether to use interleaved rotary
-        alibi_slopes: ALiBi slopes (currently not supported)
-        num_splits: Number of splits for split attention
-        return_softmax_lse: Whether to return log-sum-exp
+        q: (batch_size, seqlen, nheads, headdim)
+        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
+            or (num_blocks, page_block_size, nheads_k, headdim) if there's a block_table (i.e. paged KV cache)
+            page_block_size must be a multiple of 256.
+        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
+            or (num_blocks, page_block_size, nheads_k, headdim) if there's a block_table (i.e. paged KV cache)
+        k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
+            k with k_cache, starting at the indices specified by cache_seqlens.
+        v [optional]: (batch_size, seqlen_new, nheads_k, headdim). Similar to k.
+        cache_seqlens: context lengths for each query
+        block_table: block table for paging (not fully supported)
+        softmax_scale: scaling factor
+        causal: whether to apply causal masking
     
     Returns:
-        out: (batch_size, seqlen_q, nheads, headdim) - Attention output
+        out: (batch_size, seqlen, nheads, headdim).
     """
     # Check for unsupported features
-    if k is not None or v is not None:
-        raise NotImplementedError("KV cache update is not supported in sparse attention v3")
-    if rotary_cos is not None or rotary_sin is not None:
-        raise NotImplementedError("rotary embedding is not supported in sparse attention v3")
-    if cache_batch_idx is not None:
-        raise NotImplementedError("cache_batch_idx is not supported in sparse attention v3")
-    if cache_leftpad is not None:
-        raise NotImplementedError("cache_leftpad is not supported in sparse attention v3")
     if block_table is not None:
         raise NotImplementedError("paged attention is not supported in sparse attention v3")
-    if window_size != (-1, -1):
-        raise NotImplementedError("sliding window is not supported in sparse attention v3")
-    if softcap != 0.0:
-        raise NotImplementedError("softcap is not supported in sparse attention v3")
-    if alibi_slopes is not None:
-        raise NotImplementedError("alibi_slopes is not supported in sparse attention v3")
-    if num_splits != 0 and num_splits != 1:
-        raise NotImplementedError("num_splits > 1 is not supported in sparse attention v3")
     
     # Input layout: bshd (batch, seqlen, heads, head_dim)
     batch, seqlen_q, nheads_q, head_dim = q.shape
