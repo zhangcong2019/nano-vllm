@@ -105,7 +105,7 @@ def attn_kernel_register_fused_heads_bf16_tensor_descriptor(
     o_stride_batch, o_stride_head, o_stride_seq, o_stride_dim,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     NUM_STAGES: tl.constexpr, HEADS_PER_GROUP: tl.constexpr, 
-    sm_scale,
+    sm_scale, CAUSAL: tl.constexpr,
 ):
     """bf16 version with tensor descriptor, optimized for xpu"""
 
@@ -197,8 +197,13 @@ def attn_kernel_register_fused_heads_bf16_tensor_descriptor(
                 q_pos = offs_m
                 k_pos = offs_n
 
-                causal_mask = k_pos[None, :] > q_pos[:, None]
-                scores = tl.where(causal_mask, float('-inf'), scores)
+                if CAUSAL:
+                    causal_mask = k_pos[None, :] > q_pos[:, None]
+                    scores = tl.where(causal_mask, float('-inf'), scores)
+                else :
+                    # Non-causal: Q can attend to all valid KV positions
+                    valid_mask = offs_n[None, :] < kvlen
+                    scores = tl.where(valid_mask, scores, float('-inf'))
                 
                 m_ij = tl.max(scores, axis=1)
                 m_ij_new = tl.maximum(m_i, m_ij)
@@ -228,6 +233,7 @@ def query_sparse_attn(
     k: torch.Tensor,
     v: torch.Tensor,
     heads_per_group: int = 1,
+    is_causal: bool = True,
 ) -> torch.Tensor:
     """
     batch, num_attention_heads, qlen, head_dim = q.shape
@@ -266,7 +272,7 @@ def query_sparse_attn(
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         NUM_STAGES=NUM_STAGES, HEADS_PER_GROUP=heads_per_group,
         sm_scale=sm_scale,
-        num_stages=NUM_STAGES,
+        num_stages=NUM_STAGES, CAUSAL=is_causal,
     )
     
     # output = output.transpose(1, 2).contiguous()

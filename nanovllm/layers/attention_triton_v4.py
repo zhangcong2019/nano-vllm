@@ -189,9 +189,10 @@ def flash_attn_with_kvcache(
             q_b,
             k_b,
             v_b,
-            2
+            2,
+            is_causal=False,
         )
-        print(f"out shape sparse: {out.shape}")
+        # print(f"out shape sparse: {out.shape}")
         
         # out = F.scaled_dot_product_attention(
         #     q_b,
