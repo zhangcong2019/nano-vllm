@@ -3,7 +3,18 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+try:
+    from .attention_triton_v4 import flash_attn_varlen_func, flash_attn_with_kvcache
+    print("Using Triton v4-based Flash Attention (Intel GPU support)")
+except ImportError:
+    try:
+        from .attention_sdpa import flash_attn_varlen_func, flash_attn_with_kvcache
+        print("Using sdpa-based Flash Attention (Intel GPU support)")
+    # except ImportError:
+    #     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    #     print("Using original flash_attn")
+    except ImportError:
+        raise ImportError("No compatible Flash Attention implementation found. Please install the required dependencies.")
 from nanovllm.utils.context import get_context
 
 
@@ -68,8 +79,9 @@ class Attention(nn.Module):
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+            # print(f"flash_attn_varlen_func output shape: {o.shape}")
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+                                        softmax_scale=self.scale)
         return o
